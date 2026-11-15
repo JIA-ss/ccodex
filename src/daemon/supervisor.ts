@@ -237,7 +237,9 @@ export async function spawnDetachedGateway(options: {
   };
   atomicWrite(options.pidFile, reservation);
   mkdirSync(dirname(options.stderrLog), { recursive: true, mode: 0o700 });
-  const stderr = openSync(options.stderrLog, "w", 0o600);
+  // A replacement must retain the old process's failure evidence, including
+  // output arriving late from a process that is still shutting down.
+  const stderr = openSync(options.stderrLog, "a", 0o600);
   const args = [options.wrapperPath, "app-server"];
   if (options.remoteControlEnabled) args.push("--remote-control");
   args.push("--listen", "unix://");

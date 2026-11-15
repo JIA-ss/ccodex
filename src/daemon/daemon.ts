@@ -1,9 +1,10 @@
-import { realpathSync } from "node:fs";
+import { appendFileSync, existsSync, realpathSync } from "node:fs";
 import { createConnection } from "node:net";
 import { join, resolve } from "node:path";
 import { codexVersion, stockCodex, type Config } from "../config.js";
 import type { DaemonCommand } from "../cli/args.js";
 import { probeAppServer, type ProbeInfo } from "./probe.js";
+import { assertGatewayIdle } from "./activity.js";
 import {
   type PidRecord,
   daemonStateDirectory,
@@ -124,6 +125,7 @@ class HybridDaemon {
     this.desktop = invocation.desktop;
     this.app = invocation.app ?? false;
     return withDaemonLock(this.paths.stateDirectory, async () => {
+      appendFileSync(join(this.paths.stateDirectory, "operations.jsonl"), `${JSON.stringify({ ts: new Date().toISOString(), level: "info", message: "daemon.operation", command: invocation.command, callerPid: process.pid, parentPid: process.ppid, desktop: Boolean(invocation.desktop) })}\n`, { mode: 0o600 });
       switch (invocation.command) {
         case "bootstrap": return this.bootstrap(invocation.remoteControl);
         case "start": return this.start("started");
@@ -260,6 +262,9 @@ class HybridDaemon {
       const ready = await waitUntilReady(this.paths.socketPath);
       return this.lifecycleOutput("alreadyRunning", "pid", undefined, ready.appServerVersion);
     }
+    if (managed && current && !managedOwnsSocket) {
+      throw new Error("Refusing automatic replacement of a live gateway with a missing or rebound socket; preserve running chats and repair the listener first.");
+    }
     const { pid, info: ready } = info || managed
       ? await this.replaceEndpoint(settings)
       : await this.spawnReady(settings).catch(async (error: unknown) => {
@@ -270,6 +275,9 @@ class HybridDaemon {
   }
 
   private async restart(): Promise<JsonOutput> {
+    if (reconcileManagedProcess(this.paths.pidFile) || existsSync(this.paths.socketPath)) {
+      await assertGatewayIdle(this.paths.socketPath);
+    }
     const settings = loadSettings(this.paths.settingsFile);
     const { pid, info: ready } = await this.replaceEndpoint(settings);
     return this.lifecycleOutput("restarted", "pid", pid, ready.appServerVersion);

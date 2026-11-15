@@ -46,7 +46,7 @@ describe("daemon supervisor", () => {
     expect(JSON.parse(readFileSync(pidFile, "utf8"))).toEqual({
       pid: process.pid,
       processStartTime: processStartTime(process.pid),
-      processIdentity: { bootId: readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim(), startTicks },
+      ...(process.platform === "linux" ? { processIdentity: { bootId: readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim(), startTicks } } : {}),
     });
     release();
     expect(existsSync(pidFile)).toBe(false);

@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -91,6 +91,42 @@ async function startUnmanaged(config: Config, home: string, exitAfterProbe = fal
 }
 
 describe("npm-backed hybrid daemon lifecycle", () => {
+  it("refuses a requested restart while GPT or Claude work is active", async () => {
+    const { config } = harness();
+    process.env.FAKE_ACTIVE_THREAD = "1";
+    const first = wire(await runDaemonCommand(config, { command: "start", remoteControl: false }, fixture));
+    await expect(runDaemonCommand(config, { command: "restart", remoteControl: false }, fixture)).rejects.toThrow("chat is active");
+    expect(alive(first.pid as number)).toBe(true);
+    await expect(probeAppServer(config.publicSocket)).resolves.toMatchObject({ appServerVersion: "0.153.3" });
+  }, 20_000);
+
+  it("never auto-replaces a live current gateway merely because its public pathname disappeared", async () => {
+    const { config, record } = harness();
+    const first = wire(await runDaemonCommand(config, { command: "start", remoteControl: false }, fixture));
+    const group = JSON.parse(readFileSync(record, "utf8").trim()) as { pid: number; childPid: number };
+    rmSync(config.publicSocket);
+    await expect(runDaemonCommand(config, { command: "start", remoteControl: false }, fixture))
+      .rejects.toThrow("Refusing automatic replacement");
+    expect(alive(first.pid as number)).toBe(true);
+    expect(alive(group.childPid)).toBe(true);
+    expect(readFileSync(record, "utf8").trim().split("\n")).toHaveLength(1);
+  }, 20_000);
+
+  it("retains the previous gateway's diagnostic output on the next launch", async () => {
+    const { config, home } = harness();
+    const run = (command: Parameters<typeof runDaemonCommand>[1]["command"]) =>
+      runDaemonCommand(config, { command, remoteControl: false }, fixture);
+    await run("start");
+    const log = join(home, "app-server-daemon", "app-server.stderr.log");
+    appendFileSync(log, "previous-gateway-fatal-evidence\n");
+    await run("restart");
+    expect(readFileSync(log, "utf8")).toContain("previous-gateway-fatal-evidence");
+    const audit = readFileSync(join(home, "app-server-daemon", "operations.jsonl"), "utf8")
+      .trim().split("\n").map((line) => JSON.parse(line));
+    expect(audit.map((entry) => entry.command)).toEqual(["start", "restart"]);
+    await run("stop");
+  }, 20_000);
+
   it("matches Codex 0.153.3 wire shapes and cleans the detached process group", async () => {
     const { config, home, record } = harness();
     const run = (command: Parameters<typeof runDaemonCommand>[1]["command"], remoteControl = false) =>

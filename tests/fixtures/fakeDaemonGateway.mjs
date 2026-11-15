@@ -88,6 +88,10 @@ server.on("upgrade", (request, socket, head) => {
       const message = JSON.parse(bytes.toString());
       if (message.method === "initialize") {
         client.send(JSON.stringify({ id: message.id, result: { userAgent: "codex_app_server_daemon/0.153.3 (test)" } }));
+      } else if (message.method === "thread/loaded/list") {
+        client.send(JSON.stringify({ id: message.id, result: { data: process.env.FAKE_ACTIVE_THREAD === "1" ? ["active-test-chat"] : [] } }));
+      } else if (message.method === "thread/read") {
+        client.send(JSON.stringify({ id: message.id, result: { thread: { status: { type: "active" } } } }));
       }
     });
   });

@@ -13,6 +13,7 @@ import { Connection } from "./connection.js";
 import { Lineages } from "./lineage.js";
 import { RemoteControl } from "./remote.js";
 import { acquireSocketStartupLock, prepareUnixSocket } from "./socket.js";
+import { installListenerGuard } from "./listenerGuard.js";
 import { isStatusCommand, isStatusTurn, statusCommand, statusSkill } from "./status.js";
 import { StockClient, openStockSocket, startStockProcess, type StockProcess } from "./stock.js";
 import { Titles } from "./titles.js";
@@ -402,9 +403,11 @@ export async function startGateway(
       server.listen(socketPath, () => resolve());
     });
     chmodSync(socketPath, 0o600);
+    const listenerGuard = installListenerGuard(socketPath, 250, server);
     logger.info("gateway.started", { socketPath, codex: config.codex });
     return {
       async stop() {
+        listenerGuard.stop();
         for (const client of webSockets.clients) client.close(1001, "Gateway shutting down");
         const force = setTimeout(() => { for (const client of webSockets.clients) client.terminate(); }, 1_000);
         await new Promise<void>((resolve) => server.close(() => resolve()));
