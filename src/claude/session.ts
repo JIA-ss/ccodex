@@ -180,7 +180,9 @@ const PLAN_PROPOSED = "The plan is shown to the user, who answers in their next 
  * into Codex notifications. Claude persists everything; this object only holds the running turn.
  */
 export class ClaudeSession {
-  private peerRun?: { binding: PeerBinding; bridge: NativePeerConfig; watching: boolean; items: Map<string, string> };
+  private peerRun?: { binding: PeerBinding; bridge: NativePeerConfig; watching: boolean; items: Map<string, string>;
+    originMode: string;
+    steers: Map<string, { binding: PeerBinding; pending: boolean; rejected?: boolean; error?: string }> };
   public turn: ActiveTurn | undefined;
   /** A turn was started here: before that the chat is Desktop's new-chat draft, which stock lists nowhere. */
   public started = false;
@@ -437,10 +439,12 @@ export class ClaudeSession {
         if (JSON.stringify(normalizeUserInput(params.input ?? [])) !== JSON.stringify(this.peerRun.binding.input)) throw invalidRequest("Shared message identity conflict; no second message was sent.");
         return startedTurn(this.liveTurn()!);
       }
-      throw invalidRequest("The original Claude App is handling the previous shared message; wait or queue the next message.");
+      await this.steerPeerTurn(params);
+      return startedTurn(this.liveTurn()!);
     }
     const previousPeer = [...peerBindings(this.host.config).jobs.values()].find((binding) => binding.threadId === this.threadId
       && binding.clientId === (params.clientUserMessageId ?? params.turnId));
+    if (previousPeer?.steerOf) throw invalidRequest("This correction belongs to an earlier shared turn. Read that turn's history; it was not resent.");
     if (!owner && previousPeer) {
       if (this.turn) throw invalidRequest("Another turn is active; the old shared message was not resent.");
       const bridge = nativePeerConfig(this.host.config);
@@ -512,12 +516,59 @@ export class ClaudeSession {
     store.save(kept);
     if (this.sdk) await this.unload();
     this.discardWarm();
-    const run = { binding: kept, bridge, watching: true, items: new Map<string, string>() };
+    const steers = new Map([...store.jobs.values()].filter((b) => b.steerOf === kept.jobId)
+      .map((b) => [b.jobId, { binding: b, pending: false }] as const));
+    const run = { binding: kept, bridge, watching: true, items: new Map<string, string>(), steers,
+      originMode: next.permissionMode === "bypassPermissions" ? "bypassPermissions" : "default" };
     this.peerRun = run;
     this.state = "running";
     return startedTurn(this.openTurn(kept.turnId, input, kept.clientId, false, false, () => {
-      void this.watchPeerTurn(run, ownerPid, next.permissionMode === "bypassPermissions" ? "bypassPermissions" : "default", replayOnly);
+      void this.watchPeerTurn(run, ownerPid, run.originMode, replayOnly);
     }));
+  }
+
+  /** Send a correction at the original App's next tool boundary; never interrupt/background its task. */
+  private async steerPeerTurn(params: JsonObject): Promise<string> {
+    const run = this.peerRun;
+    if (!run || !this.turn) throw invalidRequest("no active shared turn to steer");
+    if (params.expectedTurnId && params.expectedTurnId !== this.turn.id) throw invalidRequest("The shared turn changed; correction was not sent.");
+    const owner = foreignOwner(this.host.config.claudeHome, this.threadId);
+    if (!owner) throw invalidRequest("Original App owner is unavailable; correction was not sent.");
+    const binding = preparePeerBinding(this.threadId, params.clientUserMessageId ?? params.turnId, normalizeUserInput(params.input ?? []));
+    if (binding.jobId === run.binding.jobId && JSON.stringify(binding.input) === JSON.stringify(run.binding.input)) return run.binding.turnId;
+    if (/^\/(goal|compact|clear|model|permissions|resume|fork)(\s|$)/u.test(inputText(binding.input).trim())) throw invalidRequest("App commands must be issued in the original App.");
+    const store = peerBindings(this.host.config), previous = store.jobs.get(binding.jobId);
+    if (previous && (JSON.stringify(previous.input) !== JSON.stringify(binding.input) || previous.steerOf !== run.binding.jobId)) throw invalidRequest("Shared correction identity conflict; no message sent.");
+    const kept = previous ?? { ...binding, steerOf: run.binding.jobId, parentTurnId: run.binding.turnId };
+    store.save(kept);
+    const existing = run.steers.get(kept.jobId);
+    if (existing?.pending) return run.binding.turnId;
+    const entry = existing ?? { binding: kept, pending: true };
+    entry.pending = true;
+    run.steers.set(kept.jobId, entry);
+    try {
+      const deadline = Date.now() + 5000;
+      while (true) {
+        try { await readPeerJob(run.bridge, run.binding); break; }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT" || Date.now() >= deadline) throw error;
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+      }
+      const job = await submitPeer(run.bridge, kept, owner, run.originMode, this.settings.cwd);
+      if (job.status === "failed_before_send") {
+        entry.rejected = true;
+        throw invalidRequest(job.error ?? "The original turn ended; correction was not sent.");
+      }
+      if (["failed", "unknown"].includes(job.status)) {
+        entry.error = job.error ?? "Correction delivery is unknown; no automatic resend.";
+        throw invalidRequest(entry.error);
+      }
+    } catch (error) {
+      if (!entry.rejected) entry.error = error instanceof Error ? error.message : String(error);
+      throw error;
+    } finally { entry.pending = false; }
+    return run.binding.turnId;
   }
 
   private async publishPeerHistory(binding: PeerBinding, seen: Map<string, string>): Promise<boolean> {
@@ -540,7 +591,7 @@ export class ClaudeSession {
   private async watchPeerTurn(run: NonNullable<ClaudeSession["peerRun"]>, ownerPid: number, mode: string, replayOnly = false): Promise<void> {
     try {
       if (!replayOnly) await submitPeer(run.bridge, run.binding, ownerPid, mode, this.settings.cwd);
-      const waiting: ThreadItem = { type: "reasoning", id: `${run.binding.turnId}:native-peer-status`, summary: ["Waiting for the original Claude App to receive this message…"], content: [] };
+      const waiting: ThreadItem = { type: "reasoning", id: `${run.binding.turnId}:native-peer-status`, summary: ["等待原 Claude App 接收；工作中会在工具完成后融入当前任务。"], content: [] };
       this.itemStarted(waiting);
       this.itemCompleted(waiting);
       const deadline = Date.now() + 920_000;
@@ -553,11 +604,31 @@ export class ClaudeSession {
             run.binding.verified = true;
             peerBindings(this.host.config).save(run.binding);
           }
-          this.itemCompleted({ ...waiting, summary: ["The original Claude App is processing this message."] });
+          this.itemCompleted({ ...waiting, summary: ["原 Claude App 已接收，可继续发送引导补充当前任务。"] });
+        }
+        let correctionsDone = true;
+        for (const entry of run.steers.values()) {
+          if (entry.rejected) continue;
+          if (entry.error) throw new Error(entry.error);
+          if (entry.pending) { correctionsDone = false; continue; }
+          const correction = await readPeerJob(run.bridge, entry.binding);
+          if (correction.status === "failed_before_send") {
+            entry.rejected = true;
+            this.emit("error", { threadId: this.threadId, turnId: run.binding.turnId, willRetry: false,
+              error: { message: correction.error ?? "引导未发送：原回合已经结束，请先查看原回复。", codexErrorInfo: null, additionalDetails: null } });
+            continue;
+          }
+          if (["failed", "unknown"].includes(correction.status)) throw new Error(correction.error ?? "Shared correction delivery is unknown; no automatic resend.");
+          if (correction.delivery_message_uuid) {
+            if (entry.binding.nativeUuid && entry.binding.nativeUuid !== correction.delivery_message_uuid) throw new Error("Shared correction identity changed; no automatic resend.");
+            entry.binding.nativeUuid = correction.delivery_message_uuid;
+            if (!entry.binding.verified) { entry.binding.verified = true; peerBindings(this.host.config).save(entry.binding); }
+          }
+          if (correction.status !== "completed") correctionsDone = false;
         }
         const hasReply = await this.publishPeerHistory(run.binding, run.items);
         if (["failed", "failed_before_send", "unknown"].includes(job.status)) throw new Error(job.error ?? "Native App delivery is not confirmed; no automatic resend.");
-        if (job.status === "completed") {
+        if (job.status === "completed" && correctionsDone) {
           if (!job.delivery_message_uuid || !hasReply) throw new Error("Native App replied but canonical history is not yet correlated; no automatic resend.");
           this.peerRun = undefined;
           this.state = "idle";
@@ -583,7 +654,19 @@ export class ClaudeSession {
   }
 
   public async steer(params: JsonObject): Promise<string> {
-    if (this.peerRun) throw invalidRequest("Shared App input is queued between turns; the current App turn was not interrupted.");
+    if (this.peerRun) return this.steerPeerTurn(params);
+    const owner = foreignOwner(this.host.config.claudeHome, this.threadId), bridge = nativePeerConfig(this.host.config);
+    const prior = [...peerBindings(this.host.config).jobs.values()].find((b) => b.threadId === this.threadId && b.clientId === params.clientUserMessageId);
+    if (prior?.steerOf && bridge) {
+      if (JSON.stringify(prior.input) !== JSON.stringify(normalizeUserInput(params.input ?? []))) throw invalidRequest("Shared correction identity conflict; no message sent.");
+      const job = await readPeerJob(bridge, prior);
+      if (job.status !== "completed") throw invalidRequest(job.error ?? "Previous correction is not confirmed; no automatic resend.");
+      return prior.parentTurnId!;
+    }
+    if (!this.turn && owner && bridge) {
+      if (this.sdk && !this.quiet(Date.now(), 0)) throw invalidRequest("Existing background tasks must finish before sharing this App session.");
+      return (await this.startPeerTurn(params, owner, bridge)).id;
+    }
     if (!this.turn) throw invalidRequest("no active turn to steer");
     // Waiting for sub-agents the chat is done, as stock's is: Desktop then drops the copy it showed and sends a new turn.
     if (this.turn.waiting) throw invalidRequest("no active turn to steer");

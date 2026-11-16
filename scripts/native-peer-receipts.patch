@@ -1,10 +1,31 @@
 --- a/bridge.py
 +++ b/bridge.py
-@@ -276,7 +276,13 @@
-         for other in job_files():
-             j = load_json(other)
-             if j.get("session_id") == session_id and j.get("status") in ("queued", "running", "unknown"):
+@@ -242 +242,2 @@
+-                            require_native: bool = False, expected_native_pid: int | None = None) -> dict:
++                            require_native: bool = False, expected_native_pid: int | None = None,
++                            steer_of: str | None = None) -> dict:
+@@ -256,0 +258,5 @@
++    if steer_of:
++        job_path(steer_of)
++        if not require_native or fork_session:
++            raise ValueError("STEER_REQUIRES_NATIVE: steering needs the same original App owner")
++        payload["steer_of"] = steer_of
+@@ -275,0 +282,10 @@
++        if steer_of:
++            parent = claude_job_status(steer_of)
++            if (parent.get("steer_of") or parent.get("session_id") != session_id
++                    or parent.get("transport") != "native_peer" or parent.get("expected_native_pid") != expected_native_pid
++                    or parent.get("status") not in ("queued", "running")):
++                rejected = {**payload, "job_id": key, "fingerprint": fingerprint, "title": s.custom_title or s.summary,
++                            "status": "failed_before_send", "created_at": now(),
++                            "error": "STEER_TURN_ENDED: the original shared turn is no longer active; this correction was not sent."}
++                write_json(path, rejected)
++                return claude_job_status(key)
+@@ -279 +295,10 @@
 -                raise ValueError("SESSION_PENDING: reconcile the existing continuation before sending another")
++                observed = claude_job_status(other.stem)["status"]
++                if steer_of and observed != "unknown" and (other.stem == steer_of or j.get("steer_of") == steer_of):
++                    continue
 +                # A rejected attempt needs a durable receipt too. Otherwise retrying
 +                # that same client message later could unexpectedly submit it.
 +                blocked = {**payload, "job_id": key, "fingerprint": fingerprint, "title": s.custom_title or s.summary,
@@ -12,14 +33,33 @@
 +                           "error": "SESSION_PENDING: the previous shared message needs reconciliation. This message was not sent; no automatic resend."}
 +                write_json(path, blocked)
 +                return claude_job_status(key)
-         payload["resolved_directory"] = s.cwd or directory
-         if not payload["resolved_directory"] or not Path(payload["resolved_directory"]).is_dir():
-             raise ValueError("Session working directory is unavailable")
-@@ -422,6 +428,118 @@
-             pass  # Socket write is NOT delivery proof; canonical transcript readback follows.
- 
- 
-+def peer_receipt(records, job):
+@@ -327,0 +353,3 @@
++    if j["transport"] == "native_peer":
++        peer_worker(path, j)
++        return
+@@ -339,3 +366,0 @@
+-        if j["transport"] == "native_peer":
+-            peer_worker(path, j)
+-            return
+@@ -424,0 +450,175 @@
++def peer_event(r):
++    """Only native peer user/absorbed-input records, never arbitrary text copies."""
++    if r.get("type") == "user" and (r.get("origin") or {}).get("kind") == "peer":
++        return r.get("origin"), r.get("message", {}).get("content", ""), r.get("uuid")
++    a = r.get("attachment") or {}
++    if r.get("type") == "attachment" and a.get("type") == "queued_command" and (a.get("origin") or {}).get("kind") == "peer":
++        return a["origin"], a.get("prompt", ""), a.get("source_uuid") or r.get("uuid")
++    return None
++
++
++def peer_group(job):
++    root = job.get("steer_of") or job["job_id"]
++    return {p.stem for p in job_files() if (lambda j: j.get("session_id") == job["session_id"]
++            and j.get("transport") == "native_peer" and j.get("expected_native_pid") == job.get("expected_native_pid")
++            and (p.stem == root or j.get("steer_of") == root) and j.get("submission_started_at") is not None)(load_json(p))}
++
++
++def peer_receipt(records, job, allowed_job_ids=None):
 +    """Read-only correlation on the current native branch, including preserved compactions.
 +
 +    A compact summary is transcript bookkeeping, not another human prompt. Re-link
@@ -30,14 +70,14 @@
 +    marker = "[Codex bridge request " + job["job_id"] + "]"
 +    entries = {r["uuid"]: r for r in records if isinstance(r.get("uuid"), str)
 +               and r.get("type") in ("user", "assistant", "system", "attachment", "progress")}
-+    delivered = [r for r in entries.values() if r.get("type") == "user"
++    delivered = [r for r in entries.values() if peer_event(r)
 +                 and not r.get("isSidechain") and not r.get("teamName")
-+                 and (r.get("origin") or {}).get("kind") == "peer"
-+                 and marker in text_content(r.get("message", {}).get("content", ""), 100_000)]
++                 and marker in text_content(peer_event(r)[1], 100_000)]
 +    if len(delivered) != 1:
 +        return {"delivery_found": False}  # Missing window or ambiguous evidence: fail closed.
 +    delivery = delivered[0]
-+    if job.get("delivery_message_uuid") not in (None, delivery["uuid"]):
++    native_uuid = peer_event(delivery)[2]
++    if job.get("delivery_message_uuid") not in (None, native_uuid):
 +        return {"delivery_found": False, "error": "Native delivery identity changed; inspect original history"}
 +    for r in list(entries.values()):
 +        if r.get("type") != "system" or r.get("subtype") != "compact_boundary":
@@ -62,9 +102,9 @@
 +            if candidate.get("parentUuid") == anchor and uid != head:
 +                entries[uid] = {**candidate, "parentUuid": tail}
 +    chain = _build_conversation_chain(list(entries.values()))
-+    receipt = {"delivery_found": True, "delivery_message_uuid": delivery["uuid"],
++    receipt = {"delivery_found": True, "delivery_message_uuid": native_uuid, "delivery_record_uuid": delivery["uuid"],
 +               "delivery_prompt_id": delivery.get("promptId"), "terminal": False}
-+    seen, answer = False, []
++    seen, answer, terminal_id = False, [], None
 +    for r in chain:
 +        if r["uuid"] == delivery["uuid"]:
 +            seen = True
@@ -73,6 +113,22 @@
 +            continue
 +        msg = r.get("message") or {}
 +        blocks = msg.get("content", [])
++        # One API message may persist thinking and text as separate end_turn records.
++        if receipt["terminal"] and (r.get("type") in ("user", "assistant") or peer_event(r)) and not (
++                r.get("type") == "assistant" and terminal_id is not None and msg.get("id") == terminal_id):
++            break
++        event = peer_event(r)
++        if event:
++            linked = event[0].get("from") == "bridge:codex" and any(
++                "[Codex bridge request " + key + "]" in text_content(event[1], 100_000) for key in allowed_job_ids or [])
++            if linked:
++                continue
++            receipt["error"] = "Another prompt arrived before the correlated reply; inspect native history"
++            break
++        attachment = r.get("attachment") or {}
++        if r.get("type") == "attachment" and attachment.get("type") == "queued_command" and attachment.get("prompt") and attachment.get("commandMode") != "task-notification":
++            receipt["error"] = "Another prompt arrived before the correlated reply; inspect native history"
++            break
 +        if r.get("type") == "user":
 +            tool_result = r.get("toolUseResult") is not None or isinstance(blocks, list) and any(
 +                isinstance(b, dict) and b.get("type") == "tool_result" for b in blocks)
@@ -91,15 +147,17 @@
 +                answer.append(plain)
 +            if msg.get("stop_reason") == "end_turn":
 +                receipt.update(terminal=True, terminal_message_uuid=r["uuid"])
-+                break  # Later turns must never be appended to this reply.
++                terminal_id = msg.get("id")
 +    receipt["result"] = "\n".join(answer)
++    if receipt["terminal"] and not answer:
++        receipt["terminal"] = False  # A thinking block alone is not a usable reply.
 +    return receipt
 +
 +
 +def apply_peer_receipt(j, receipt):
 +    if receipt.get("delivery_found"):
 +        j.setdefault("delivery_verified_at", now())
-+        j.update(delivery="verified_in_transcript", delivery_message_uuid=receipt["delivery_message_uuid"],
++        j.update(delivery="verified_in_transcript", delivery_message_uuid=receipt["delivery_message_uuid"], delivery_record_uuid=receipt.get("delivery_record_uuid"),
 +                 delivery_prompt_id=receipt.get("delivery_prompt_id"), partial_result=receipt.get("result", "")[-12000:])
 +    if receipt.get("error"):
 +        j.update(status="unknown", error=receipt["error"])
@@ -124,20 +182,107 @@
 +        if j.get("status") == "completed":
 +            return claude_job_status(job_id)
 +        records, partial = tail_records(transcript_path(info(j["session_id"], j.get("directory"))), 8_000_000)
-+        receipt = peer_receipt(records, j)
++        receipt = peer_receipt(records, j, peer_group(j))
 +        apply_peer_receipt(j, receipt)
 +        j.update(receipt_reconciled_at=now(), receipt_window_is_partial=partial)
 +        write_json(path, j)
 +    return claude_job_status(job_id)
 +
 +
- def peer_worker(path, j):
-     j.update(status="running", worker_pid=os.getpid(), worker_created=psutil.Process().create_time(), started_at=now())
-     write_json(path, j)
-@@ -444,39 +562,13 @@
-         write_json(path, j)
-         deadline = now() + j["timeout_seconds"]
-         while now() < deadline:
++def wait_peer_predecessors(job):
++    """Preserve root/correction send order even when worker scheduling differs."""
++    root = job.get("steer_of")
++    if not root:
++        return
++    deadline = now() + 20
++    while True:
++        ready = True
++        parent = claude_job_status(root)
++        if parent["status"] not in ("queued", "running"):
++            raise ValueError("STEER_TURN_ENDED: original shared turn is not active; correction not sent")
++        for p in job_files():
++            other = load_json(p)
++            predecessor = p.stem == root or other.get("steer_of") == root and other.get("created_at", float("inf")) < job["created_at"]
++            if not predecessor or other.get("session_id") != job["session_id"]:
++                continue
++            observed = claude_job_status(p.stem)["status"]
++            if observed in ("unknown", "failed"):
++                raise ValueError("Previous shared delivery is unknown; correction not sent")
++            if observed != "failed_before_send" and not other.get("socket_written_at"):
++                ready = False
++        if ready:
++            return
++        if now() >= deadline:
++            raise ValueError("Previous input dispatch not acknowledged; correction not sent")
++        time.sleep(0.02)
++
++
+@@ -426,2 +626,6 @@
+-    j.update(status="running", worker_pid=os.getpid(), worker_created=psutil.Process().create_time(), started_at=now())
+-    write_json(path, j)
++    # Serialize only dispatch, not the whole model turn: explicit steering can
++    # join its active root without waiting for that root's terminal reply.
++    if path.exists():
++        j = load_json(path)
++        if j.get("status") != "queued":
++            return
+@@ -429,3 +633,38 @@
+-        live = live_sessions().get(j["session_id"])
+-        if not live:
+-            j.update(status="failed_before_send", error="Native session exited before send")
++        wait_peer_predecessors(j)
++    except Exception as exc:
++        with (STATE / (j["session_id"] + ".lock")).open("a") as lock:
++            fcntl.flock(lock, fcntl.LOCK_EX)
++            if path.exists():
++                j = load_json(path)
++                if j.get("status") != "queued":
++                    return
++            j.update(status="failed_before_send", error=str(exc), finished_at=now())
++            write_json(path, j)
++        return
++    with (STATE / (j["session_id"] + ".lock")).open("a") as lock:
++        fcntl.flock(lock, fcntl.LOCK_EX)
++        if path.exists():
++            j = load_json(path)
++            if j.get("status") != "queued":
++                return
++        j.update(status="running", worker_pid=os.getpid(), worker_created=psutil.Process().create_time(), started_at=now())
++        write_json(path, j)
++        try:
++            live = live_sessions().get(j["session_id"])
++            if not live:
++                raise ValueError("Native session exited before send")
++            if j.get("require_native") and live.get("pid") != j.get("expected_native_pid"):
++                raise ValueError("Native App owner changed before delivery; no message sent")
++            if j.get("steer_of") and claude_job_status(j["steer_of"]).get("status") not in ("queued", "running"):
++                raise ValueError("STEER_TURN_ENDED: original shared turn ended; correction not sent")
++            s = info(j["session_id"], j.get("directory"))
++            marker = "[Codex bridge request " + j["job_id"] + "]"
++            content = marker + "\n" + ("[Codex bridge steer " + j["steer_of"] + "]\n" if j.get("steer_of") else "") + j["prompt"]
++            j.update(submission_started_at=now(), marker=marker, native_pid=live["pid"])
++            write_json(path, j)
++            native_peer_send(live, content, str(uuid.UUID(j["job_id"])), j["permission_mode"])
++            j.update(socket_written_at=now())
++            write_json(path, j)
++        except Exception as exc:
++            j.update(status="unknown" if j.get("submission_started_at") else "failed_before_send", error=str(exc), finished_at=now())
++            write_json(path, j)
+@@ -433,12 +672 @@
+-        if j.get("require_native") and live.get("pid") != j.get("expected_native_pid"):
+-            j.update(status="failed_before_send", error="Native App owner changed before delivery; no message sent")
+-            return
+-        s = info(j["session_id"], j.get("directory"))
+-        marker = "[Codex bridge request " + j["job_id"] + "]"
+-        content = marker + "\n" + j["prompt"]
+-        # Persist submission intent before touching the socket. A crash never authorizes a replay.
+-        j.update(submission_started_at=now(), marker=marker, native_pid=live["pid"])
+-        write_json(path, j)
+-        native_peer_send(live, content, str(uuid.UUID(j["job_id"])), j["permission_mode"])
+-        j.update(socket_written_at=now())
+-        write_json(path, j)
++    try:
+@@ -447,29 +675,4 @@
 -            records, _ = tail_records(transcript_path(s), 2_000_000)
 -            seen = False
 -            answer = []
@@ -168,42 +313,24 @@
 -            if seen:
 -                j.update(delivery="verified_in_transcript", partial_result="\n".join(answer)[-12000:])
 +            records, _ = tail_records(transcript_path(s), 8_000_000)
-+            receipt = peer_receipt(records, j)
++            receipt = peer_receipt(records, j, peer_group(j))
 +            apply_peer_receipt(j, receipt)
 +            if receipt.get("delivery_found"):
-                 write_json(path, j)
+@@ -477,3 +680,2 @@
 -                if terminal:
 -                    j.update(status="completed", result="\n".join(answer), resumed_session_id=j["session_id"], result_subtype="native_peer_end_turn")
 -                    return
 +            if receipt.get("error") or receipt.get("terminal"):
 +                return
-             # Busy native work may take time; poll files, never resubmit.
-             time.sleep(1)
-         j.update(status="unknown", error="No correlated terminal reply within deadline; inspect native transcript or approval UI. Never automatically resend.")
-@@ -539,7 +631,7 @@
- def main():
-     os.umask(0o077)
-     parser = argparse.ArgumentParser()
+@@ -542 +744 @@
 -    parser.add_argument("action", choices=["mcp", "worker", "list", "read", "progress", "continue", "job", "panel"])
 +    parser.add_argument("action", choices=["mcp", "worker", "list", "read", "progress", "continue", "job", "panel", "reconcile"])
-     parser.add_argument("arguments", nargs="?", default="{}", help="JSON args, @file, or job_id for worker")
-     a = parser.parse_args()
-     if a.action == "worker":
-@@ -552,7 +644,7 @@
-     else:
-         raw = Path(a.arguments[1:]).read_text() if a.arguments.startswith("@") else a.arguments
-         args = json.loads(raw)
+@@ -555 +757 @@
 -        f = dict(zip(["list", "read", "progress", "continue", "job", "panel"], TOOLS))[a.action]
 +        f = reconcile_peer_job if a.action == "reconcile" else dict(zip(["list", "read", "progress", "continue", "job", "panel"], TOOLS))[a.action]
-         try:
-             print(json.dumps(f(**args), ensure_ascii=False, indent=2))
-         except Exception as exc:
 --- a/test_bridge.py
 +++ b/test_bridge.py
-@@ -48,8 +48,12 @@
-         job_id = "a"*32
-         bridge.write_json(bridge.STATE / (job_id+".json"), {"session_id": self.sid, "status": "unknown"})
-         with patch.object(bridge, "info", return_value=self.session), patch.object(bridge, "live_sessions", return_value={}), patch.object(bridge.subprocess, "Popen") as spawn:
+@@ -51,2 +51,6 @@
 -            with self.assertRaisesRegex(ValueError, "SESSION_PENDING"):
 -                bridge.claude_session_continue(self.sid, "hello", "new")
 +            rejected = bridge.claude_session_continue(self.sid, "hello", "new")
@@ -212,13 +339,7 @@
 +            bridge.write_json(bridge.STATE / (job_id+".json"), {"session_id": self.sid, "status": "completed"})
 +            again = bridge.claude_session_continue(self.sid, "hello", "new")
 +            self.assertEqual(again["status"], "failed_before_send")
-             spawn.assert_not_called()
- 
-     def test_unqualified_live_native_version_fails_before_send(self):
-@@ -113,6 +117,80 @@
-         out = bridge.text_content([{"type":"image","source":{"data":"private-base64"}},{"type":"thinking","thinking":"private-thinking"},{"type":"text","text":"safe"}])
-         self.assertIn("image omitted",out)
-         self.assertNotIn("private-",out)
+@@ -115,0 +120,144 @@
 +
 +    def receipt_fixture(self):
 +        job = {"job_id": "d" * 32, "session_id": self.sid}
@@ -293,6 +414,73 @@
 +        self.assertEqual(result["prior_receipt_error"], "old correlation bug")
 +        send.assert_not_called()
 +        spawn.assert_not_called()
- 
-     def test_native_auth_and_message_parity_use_actual_sender_mode(self):
-         # A local socket fixture validates real bytes, auth separation and destination binding.
++
++    def test_absorbed_peer_receipt_uses_source_uuid_and_collects_split_terminal_blocks(self):
++        job, user, assistant, peer = self.receipt_fixture()
++        attachment = {"type": "attachment", "uuid": "absorbed", "parentUuid": "seed", "attachment": {
++            "type": "queued_command", "source_uuid": "source", "origin": peer["origin"], "prompt": peer["message"]["content"]}}
++        thinking = assistant("thinking", "absorbed", "")
++        thinking["message"].update(id="one-api-message", content=[{"type": "thinking", "thinking": "private"}])
++        final = assistant("final", "thinking", "corrected")
++        final["message"]["id"] = "one-api-message"
++        records = [user("seed", None, "old"), attachment, thinking]
++        self.assertFalse(bridge.peer_receipt(records, job)["terminal"])
++        receipt = bridge.peer_receipt(records + [final], job)
++        self.assertEqual(receipt["delivery_message_uuid"], "source")
++        self.assertEqual(receipt["delivery_record_uuid"], "absorbed")
++        self.assertEqual(receipt["result"], "corrected")
++        self.assertTrue(receipt["terminal"])
++
++    def test_only_explicitly_linked_corrections_can_join_a_receipt(self):
++        job, user, assistant, peer = self.receipt_fixture()
++        other = user("correction", "peer", "[Codex bridge request " + "e"*32 + "]\ncorrection",
++                     isMeta=True, origin={"kind": "peer", "from": "bridge:codex"})
++        records = [user("seed", None, "old"), peer, other, assistant("done", "correction", "combined")]
++        self.assertIn("error", bridge.peer_receipt(records, job))
++        linked = bridge.peer_receipt(records, job, {job["job_id"], "e"*32})
++        self.assertTrue(linked["terminal"])
++        self.assertEqual(linked["result"], "combined")
++        other["origin"]["from"] = "different-peer"
++        self.assertIn("error", bridge.peer_receipt(records, job, {"e"*32}))
++
++    def test_linked_steer_is_deduplicated_and_unknown_still_blocks(self):
++        root = "f"*32
++        owner = {"pid": 123, "version": "2.1.325", "messagingSocketPath": "/tmp/test.sock"}
++        bridge.write_json(bridge.job_path(root), {"job_id": root, "session_id": self.sid, "status": "running",
++            "transport": "native_peer", "expected_native_pid": 123,
++            "worker_pid": os.getpid(), "worker_created": bridge.psutil.Process().create_time()})
++        args = dict(session_id=self.sid, prompt="correction", request_id="stable-correction", require_native=True,
++                    expected_native_pid=123, steer_of=root)
++        with patch.object(bridge, "info", return_value=self.session), patch.object(bridge, "live_sessions", return_value={self.sid: owner}), \
++             patch.object(bridge.subprocess, "Popen") as spawn:
++            first = bridge.claude_session_continue(**args)
++            second = bridge.claude_session_continue(**args)
++            self.assertEqual(first["job_id"], second["job_id"])
++            self.assertEqual(spawn.call_count, 1)
++            root_job = bridge.load_json(bridge.job_path(root));root_job["status"] = "unknown";bridge.write_json(bridge.job_path(root), root_job)
++            rejected = bridge.claude_session_continue(**{**args, "request_id": "different-correction"})
++            self.assertEqual(rejected["status"], "failed_before_send")
++            self.assertEqual(spawn.call_count, 1)
++
++    def test_competing_absorbed_human_input_is_not_attributed_to_the_bridge(self):
++        job, user, assistant, peer = self.receipt_fixture()
++        human = {"type": "attachment", "uuid": "human", "parentUuid": "peer", "attachment": {
++            "type": "queued_command", "commandMode": "prompt", "origin": {"kind": "human"}, "prompt": "a different request"}}
++        receipt = bridge.peer_receipt([user("seed", None, "old"), peer, human, assistant("final", "human", "other answer")], job)
++        self.assertIn("Another prompt", receipt["error"])
++        self.assertFalse(receipt["terminal"])
++
++    def test_corrections_wait_for_root_and_prior_correction_dispatch(self):
++        root, prior, current = "1"*32, "2"*32, "3"*32
++        common = {"session_id": self.sid, "status": "running", "worker_pid": os.getpid(), "worker_created": bridge.psutil.Process().create_time()}
++        bridge.write_json(bridge.job_path(root), {**common, "job_id": root, "created_at": bridge.now()})
++        bridge.write_json(bridge.job_path(prior), {**common, "job_id": prior, "steer_of": root, "created_at": bridge.now()})
++        job = {**common, "job_id": current, "steer_of": root, "created_at": bridge.now()}
++        waits = []
++        def advance(_):
++            key = root if not waits else prior
++            value = bridge.load_json(bridge.job_path(key));value["socket_written_at"] = bridge.now();bridge.write_json(bridge.job_path(key), value)
++            waits.append(key)
++        with patch.object(bridge.time, "sleep", side_effect=advance):
++            bridge.wait_peer_predecessors(job)
++        self.assertEqual(waits, [root, prior])

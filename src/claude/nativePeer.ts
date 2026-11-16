@@ -9,8 +9,8 @@ import { v5 as uuidv5 } from "uuid";
 import type { Config } from "../config.js";
 import type { UserInput } from "../protocol/codex.js";
 
-export interface NativePeerConfig { enabled: true; python: string; script: string; stateDir?: string }
-export interface PeerBinding { jobId: string; threadId: string; turnId: string; clientId: string; input: UserInput[]; nativeUuid?: string; verified?: boolean }
+export interface NativePeerConfig { enabled: true; python: string; script: string; stateDir?: string; softSteerDefault?: boolean }
+export interface PeerBinding { jobId: string; threadId: string; turnId: string; clientId: string; input: UserInput[]; nativeUuid?: string; verified?: boolean; steerOf?: string; parentTurnId?: string }
 export interface PeerJob { job_id: string; status: string; error?: string; delivery_message_uuid?: string; partial_result?: string; result?: string; transport?: string; expected_native_pid?: number }
 const execute = promisify(execFile);
 
@@ -64,7 +64,8 @@ export function preparePeerBinding(threadId: string, clientId: unknown, input: U
 export async function submitPeer(bridge: NativePeerConfig, binding: PeerBinding, ownerPid: number, mode: string, cwd: string): Promise<PeerJob> {
   const prompt = binding.input.map((item) => item.type === "text" ? item.text : "").join("\n");
   const args = { session_id: binding.threadId, prompt, request_id: `ccodex-native-peer:${binding.threadId}:${binding.clientId}`,
-    permission_mode: mode, directory: cwd, timeout_seconds: 900, require_native: true, expected_native_pid: ownerPid };
+    permission_mode: mode, directory: cwd, timeout_seconds: 900, require_native: true, expected_native_pid: ownerPid,
+    ...(binding.steerOf ? { steer_of: binding.steerOf } : {}) };
   const state = bridge.stateDir ?? join(homedir(), ".local", "state", "claude-sessions-bridge");
   mkdirSync(state, { recursive: true, mode: 0o700 });
   const payload = join(state, `${binding.jobId}.request.json`), temporary = `${payload}.${process.pid}.tmp`;

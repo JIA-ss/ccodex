@@ -548,6 +548,23 @@ function turnStarts(records: readonly TranscriptChainRecord[], subagentPromptUui
     lastBlock = undefined;
   };
   records.forEach((record, index) => {
+    const absorbed = record.type === "attachment" ? object(record.attachment) : undefined;
+    const origin = absorbed?.type === "queued_command" ? peerOrigin(absorbed.origin) : record.type === "user" ? peerOrigin(record.origin) : undefined;
+    const body = typeof origin?.body === "string" ? origin.body : "";
+    if (origin?.from === "bridge:codex" && /\[Codex bridge request [a-f0-9]{32}\]/u.test(body)) {
+      if (/\[Codex bridge steer [a-f0-9]{32}\]/u.test(body)) {
+        // Explicit correction of an existing shared turn: keep its own user item.
+        answer = false;
+        lastBlock = undefined;
+        return;
+      }
+      if (absorbed) {
+        starts.push({ index, id: string(absorbed.source_uuid) ?? record.uuid });
+        answer = false;
+        lastBlock = undefined;
+        return;
+      }
+    }
     if (record.type === "assistant" && starts.length && !subagentPromptUuid) {
       assistantBlocks(record).forEach((block, position) => {
         if (answer) goOn(index);

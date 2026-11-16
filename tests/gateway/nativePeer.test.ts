@@ -71,9 +71,40 @@ describe("shared native App writer", () => {
     await client.request("turn/start", { threadId: sid, clientUserMessageId: clientId, input: text("one") });
     await expect(client.request("turn/start", { threadId: sid, clientUserMessageId: clientId, input: text("different") })).rejects.toThrow("identity conflict");
     await expect(client.request("turn/interrupt", { threadId: sid })).rejects.toThrow("No App task was stopped");
-    await expect(client.request("turn/steer", { threadId: sid, input: text("two") })).rejects.toThrow("not interrupted");
+    await expect(client.request("turn/steer", { threadId: sid, input: text("two") })).rejects.toThrow("stable client message");
     const done = await client.waitFor("turn/completed", (p) => p.threadId === sid, 10000);expect(done.turn.status).toBe("completed");
     expect(fakeClaude.calls.some((c) => c.method === "interrupt")).toBe(false);
+  }, 20000);
+
+  it("soft-steers the active App turn, deduplicates corrections, and retains their client bubbles", async () => {
+    process.env.FAKE_PEER_DELAY = "1200";
+    const { root, sid, client, state } = await fixture();
+    const firstId = randomUUID(), nextId = randomUUID(), lastId = randomUUID(), queuedId = randomUUID();
+    const result = await client.request("turn/start", { threadId: sid, clientUserMessageId: firstId, input: text("one") });
+    const deadline = Date.now() + 3000;
+    while (!existsSync(join(root, "sends.jsonl")) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+    const correction = { threadId: sid, expectedTurnId: result.turn.id, clientUserMessageId: nextId, input: text("two") };
+    expect(await client.request("turn/steer", correction)).toEqual({ turnId: result.turn.id });
+    expect(await client.request("turn/steer", correction)).toEqual({ turnId: result.turn.id });
+    const extra = await client.request("turn/start", { threadId: sid, clientUserMessageId: lastId, input: text("three") });
+    expect(extra.turn.id).toBe(result.turn.id);
+    await client.request("thread/queue/add", { threadId: sid, clientUserMessageId: queuedId, input: text("four") });
+    expect((await client.request("thread/queue/list", { threadId: sid })).data).toHaveLength(0);
+    const done = await client.waitFor("turn/completed", (p) => p.threadId === sid && p.turn.id === result.turn.id, 10000);
+    expect(done.turn.status).toBe("completed");
+    const turns = (await client.request("thread/read", { threadId: sid, includeTurns: true })).thread.turns;
+    const turn = turns.find((t: any) => t.id === result.turn.id);
+    expect(turn.items.filter((i: any) => i.type === "userMessage").map((i: any) => i.clientId)).toEqual([firstId, nextId, lastId, queuedId]);
+    expect(turn.items.some((i: any) => i.type === "agentMessage" && i.text.includes("two") && i.text.includes("three"))).toBe(true);
+    expect(readFileSync(join(root, "sends.jsonl"), "utf8").trim().split("\n")).toHaveLength(4);
+    expect(await client.request("turn/steer", correction)).toEqual({ turnId: result.turn.id });
+    expect(readFileSync(join(root, "sends.jsonl"), "utf8").trim().split("\n")).toHaveLength(4);
+    const paged = await client.request("thread/items/list", { threadId: sid, turnId: result.turn.id, limit: 100 });
+    expect(paged.data.filter((v: any) => v.item.type === "userMessage").map((v: any) => v.item.clientId)).toEqual([firstId, nextId, lastId, queuedId]);
+    const receipts = readFileSync(join(root, "sends.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(receipts.length).toBe(4);
+    expect(fakeClaude.calls.some((c) => c.method === "interrupt" || c.method === "backgroundTasks")).toBe(false);
+    expect(fakeClaude.prompts.length).toBe(0);
   }, 20000);
 
   it("preserves unrelated frames and normal RPC identities; maps inclusive cursors both ways", () => {

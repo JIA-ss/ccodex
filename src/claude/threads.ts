@@ -1105,7 +1105,9 @@ export class ClaudeThreads {
       case "thread/queue/add": {
         const session = this.session(threadId);
         const queuedSubmission = { id: randomUUID(), input: normalizeUserInput(params.input ?? []), clientUserMessageId: params.clientUserMessageId };
-        if (session.busy && !session.waitingForAgents) session.queued.push(queuedSubmission);
+        const bridge = nativePeerConfig(this.config);
+        const sharedSteering = bridge && bridge.softSteerDefault !== false && foreignOwner(this.config.claudeHome, threadId);
+        if (session.busy && !session.waitingForAgents && !sharedSteering) session.queued.push(queuedSubmission);
         else await session.startTurn({ input: queuedSubmission.input, clientUserMessageId: queuedSubmission.clientUserMessageId });
         this.gateway.emit(threadId, "thread/queue/changed", { threadId });
         return { queuedSubmission };
