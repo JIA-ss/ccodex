@@ -62,6 +62,25 @@ function conversation(): TranscriptRecord[] {
 }
 
 describe("native Claude transcript projector", () => {
+  it("does not let a compact summary consume the preserved peer's prompt identity", async () => {
+    const old = { ...prompt("old", null, "Earlier request", 1), promptId: "old-prompt" };
+    const oldReply = assistant("old-reply", old.uuid, "old-message", [{ type: "text", text: "Earlier reply" }], 2, "end_turn");
+    const peer: UserRecord = { ...prompt("peer", oldReply.uuid, "Shared request", 3), isMeta: true,
+      promptId: "peer-prompt", origin: { kind: "peer", from: "bridge:codex", name: "Codex session bridge", body: "Shared request", msg_id: "shared-job" } };
+    const records: TranscriptRecord[] = [old, oldReply, peer,
+      { type: "system", subtype: "compact_boundary", ...envelope("compact", null, 4), logicalParentUuid: peer.uuid,
+        compactMetadata: { trigger: "auto", preservedMessages: { anchorUuid: "summary", uuids: [old.uuid, oldReply.uuid, peer.uuid] } } },
+      { ...prompt("summary", "compact", "Generated summary", 4), origin: undefined, isCompactSummary: true, promptId: "peer-prompt" },
+      assistant("shared-reply", "summary", "shared-message", [{ type: "text", text: "Shared reply" }], 5, "end_turn"),
+    ];
+    const projection = await projectTranscript({ sessionId: "session", path: "/tmp/session.jsonl", records });
+    const shared = projection.turns.find((turn) => turn.id === peer.uuid);
+    expect(shared).toBeDefined();
+    expect(shared!.status).toBe("completed");
+    expect(shared!.items.some((item) => item.type === "agentMessage" && item.text === "Shared reply")).toBe(true);
+    expect(shared!.items.some((item) => item.type === "agentMessage" && item.text === "Earlier reply")).toBe(false);
+  });
+
   it("keeps a message sent mid-turn (Desktop's steer) in the running turn, like live; a message sent after it starts a turn", async () => {
     const queued = (operation: "enqueue" | "dequeue", content?: string): QueueOperationRecord =>
       ({ type: "queue-operation", operation, sessionId: "session", ...(content ? { content } : {}) });

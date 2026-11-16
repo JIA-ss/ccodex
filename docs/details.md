@@ -144,6 +144,14 @@ The existing process receives input with native priority `next`; the current App
 
 The first version accepts text only. Model, effort, speed, plan/permission modes, workspace, history edits, stop and steer controls remain with the original App; this path does not secretly alter its settings or stop its background work. App refusal/hold policies remain effective. Disabling the sidecar prevents new shared submissions; let active shared work reach a known terminal state before removing live methods. Keep private receipts and ID bindings for retries and history.
 
+### Receipts across automatic compaction
+
+Compaction summaries can carry the current peer prompt ID before the preserved peer record is replayed. They must not consume that ID when projecting turn boundaries: otherwise a completed shared reply gets merged into an older turn.
+
+The separate Python helper also needs the matching receipt repair in [`scripts/native-peer-receipts.patch`](../scripts/native-peer-receipts.patch). Apply it in that helper's `scripts` directory with `patch -p1`, then run its `test_bridge.py` using the configured Python environment. The patch follows native preserved-message links and the pinned SDK's current-branch selection; generated summaries and tool results are bookkeeping, while a genuinely competing prompt still prevents attribution. It stops at the first correlated `end_turn`, retaining unknown outcomes when evidence is incomplete.
+
+An already submitted native job can be reconciled with `bridge.py reconcile '{"job_id":"existing-job-key"}'`. This only reads history and repairs the durable receipt; it never submits a prompt or starts a model. Rejected attempts get their own `failed_before_send` receipt so retrying the same client message after the earlier block clears cannot silently send it later. Preserve the prior receipt and inspect canonical history before repairing an old incident; never reset an unknown job to queued.
+
 ## Troubleshooting
 
 - `ccodex doctor` checks Node, Codex and Claude and their logins, the prebuilt native

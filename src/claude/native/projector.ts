@@ -555,7 +555,9 @@ function turnStarts(records: readonly TranscriptChainRecord[], subagentPromptUui
         answer = (messageText(block)?.length ?? 0) >= ANSWER_CHARS;
       });
     }
-    if (record.type !== "user") return;
+    // A compact summary may carry the running peer prompt's ID, but is not a
+    // submission. Consuming it here would merge the preserved peer into an old turn.
+    if (record.type !== "user" || record.isCompactSummary === true) return;
     const previous = promptId;
     promptId = record.promptId ?? promptId;
     if (steered.has(record.uuid)) return;
