@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, existsSync, fstatSync, openSync, readdirSync, readSync, statSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, readdirSync, readSync, realpathSync, statSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -24,6 +24,7 @@ import { baseOptions, claudeMode } from "./sdk.js";
 import { endedBackground, killedCommand, proposedChanges, startTool, stoppedCommand, updateToolInput, type ActiveTool, type BackgroundEnd } from "./toolMapper.js";
 import type { ClaudeThreads } from "./threads.js";
 import { visualizeOptions } from "./visualize.js";
+import { nativePeerConfig, peerBindings, preparePeerBinding, readPeerJob, submitPeer, type PeerBinding, type NativePeerConfig } from "./nativePeer.js";
 
 export interface SessionSettings {
   cwd: string;
@@ -179,6 +180,7 @@ const PLAN_PROPOSED = "The plan is shown to the user, who answers in their next 
  * into Codex notifications. Claude persists everything; this object only holds the running turn.
  */
 export class ClaudeSession {
+  private peerRun?: { binding: PeerBinding; bridge: NativePeerConfig; watching: boolean; items: Map<string, string> };
   public turn: ActiveTurn | undefined;
   /** A turn was started here: before that the chat is Desktop's new-chat draft, which stock lists nowhere. */
   public started = false;
@@ -302,6 +304,7 @@ export class ClaudeSession {
 
   /** Starts Claude's process before the first prompt, so that prompt does not wait for it; unused, it goes. */
   public prewarm(): void {
+    if (foreignOwner(this.host.config.claudeHome, this.threadId)) return;
     if (this.sdk || this.warm) return;
     const warm: WarmProcess = { key: this.optionsKey(), closed: false };
     this.warm = warm;
@@ -320,6 +323,9 @@ export class ClaudeSession {
   }
 
   private ensureQuery(): Query {
+    if (nativePeerConfig(this.host.config) && foreignOwner(this.host.config.claudeHome, this.threadId)) {
+      throw invalidRequest("The original Claude App owns this session; this operation cannot start or control another SDK writer.");
+    }
     if (this.sdk) return this.sdk;
     this.inbox = new Inbox();
     const ready = this.warm?.key === this.optionsKey() ? this.warm.query : undefined;
@@ -411,6 +417,7 @@ export class ClaudeSession {
 
   /** Closes the query; the next turn resumes the session from disk. */
   public unload(): Promise<void> {
+    if (this.peerRun) this.peerRun.watching = false;
     this.discardWarm();
     const sdk = this.sdk;
     this.sdk = undefined;
@@ -424,8 +431,30 @@ export class ClaudeSession {
 
   public async startTurn(params: JsonObject): Promise<Turn> {
     // Two processes writing one transcript fork it: whatever the other one writes next is lost to the chat.
-    const owner = this.turn ? undefined : foreignOwner(this.host.config.claudeHome, this.threadId);
-    if (owner) throw invalidRequest(`This chat is open in another Claude process (pid ${owner}): close it there or wait until it ends.`);
+    const owner = foreignOwner(this.host.config.claudeHome, this.threadId);
+    if (this.peerRun) {
+      if ((params.clientUserMessageId ?? params.turnId) === this.peerRun.binding.clientId && this.turn) {
+        if (JSON.stringify(normalizeUserInput(params.input ?? [])) !== JSON.stringify(this.peerRun.binding.input)) throw invalidRequest("Shared message identity conflict; no second message was sent.");
+        return startedTurn(this.liveTurn()!);
+      }
+      throw invalidRequest("The original Claude App is handling the previous shared message; wait or queue the next message.");
+    }
+    const previousPeer = [...peerBindings(this.host.config).jobs.values()].find((binding) => binding.threadId === this.threadId
+      && binding.clientId === (params.clientUserMessageId ?? params.turnId));
+    if (!owner && previousPeer) {
+      if (this.turn) throw invalidRequest("Another turn is active; the old shared message was not resent.");
+      const bridge = nativePeerConfig(this.host.config);
+      if (!bridge) throw invalidRequest("This shared message already has a receipt; re-enable its connection to read the result. It was not resent.");
+      const job = await readPeerJob(bridge, previousPeer);
+      if (job.status !== "completed") throw invalidRequest("The original shared message is not confirmed complete; it was not restarted through the SDK.");
+      return this.startPeerTurn(params, job.expected_native_pid ?? 0, bridge, true);
+    }
+    if (owner) {
+      const bridge = nativePeerConfig(this.host.config);
+      if (!bridge) throw invalidRequest(`This chat is open in another Claude process (pid ${owner}): close it there or wait until it ends.`);
+      if (this.turn || (this.sdk && !this.quiet(Date.now(), 0))) throw invalidRequest("An existing turn or background task must finish before sharing this App session.");
+      return this.startPeerTurn(params, owner, bridge);
+    }
     // A message another chat sends (Desktop's `send_message_to_thread`) comes as the tool's output, the input empty.
     const input = normalizeUserInput(params.toolOutput ? [{ type: "text", text: params.toolOutput.output, text_elements: [] }] : params.input ?? []);
     const goal = /^\/goal\s+(\S[\s\S]*)/u.exec(inputText(input))?.[1]!.trim();
@@ -460,12 +489,101 @@ export class ClaudeSession {
     return startedTurn(turn);
   }
 
+  /** Share a foreign App writer without creating a second query or changing its settings. */
+  private async startPeerTurn(params: JsonObject, ownerPid: number, bridge: NativePeerConfig, replayOnly = false): Promise<Turn> {
+    const input = normalizeUserInput(params.input ?? []);
+    const binding = preparePeerBinding(this.threadId, params.clientUserMessageId ?? params.turnId, input);
+    this.settings = this.host.nativeSettings(this.threadId);
+    const next = this.host.settingsFrom(params, this.settings);
+    let sameDirectory = next.cwd === this.settings.cwd;
+    if (!sameDirectory) { try { sameDirectory = realpathSync(next.cwd) === realpathSync(this.settings.cwd); } catch {} }
+    if (next.model !== this.settings.model || next.fast !== this.settings.fast || next.plan !== this.settings.plan
+      || (this.settings.effort !== null && next.effort !== this.settings.effort) || !sameDirectory) {
+      this.emit("thread/settings/updated", { threadId: this.threadId, threadSettings: this.host.threadSettings(this.settings) });
+      throw invalidRequest("Shared App sessions keep the original App's model, effort, workspace and modes. Change those in the original App first.");
+    }
+    if (/^\/(goal|compact|clear|model|permissions|resume|fork)(\s|$)/u.test(inputText(input).trim())) {
+      throw invalidRequest("App commands must be issued in the original App; this shared input path accepts ordinary text.");
+    }
+    const store = peerBindings(this.host.config);
+    const previous = store.jobs.get(binding.jobId);
+    if (previous && JSON.stringify(previous.input) !== JSON.stringify(binding.input)) throw invalidRequest("Shared message identity conflict; no message sent.");
+    const kept = previous ?? binding;
+    store.save(kept);
+    if (this.sdk) await this.unload();
+    this.discardWarm();
+    const run = { binding: kept, bridge, watching: true, items: new Map<string, string>() };
+    this.peerRun = run;
+    this.state = "running";
+    return startedTurn(this.openTurn(kept.turnId, input, kept.clientId, false, false, () => {
+      void this.watchPeerTurn(run, ownerPid, next.permissionMode === "bypassPermissions" ? "bypassPermissions" : "default", replayOnly);
+    }));
+  }
+
+  private async publishPeerHistory(binding: PeerBinding, seen: Map<string, string>): Promise<boolean> {
+    if (!binding.nativeUuid || !this.turn) return false;
+    const paged = this.host.catalog.pages(this.threadId);
+    const window = await paged.pages.newest(paged.source, 8);
+    const native = window.turns.find((turn) => turn.items.some((item) => item.type === "userMessage" && item.id === binding.nativeUuid));
+    if (!native) return false;
+    const first = native.items.findIndex((item) => item.type === "userMessage" && item.id === binding.nativeUuid);
+    for (const item of native.items.slice(first + 1)) {
+      const fingerprint = JSON.stringify(item);
+      if (seen.get(item.id) === fingerprint) continue;
+      if (!seen.has(item.id)) this.itemStarted(item);
+      if (!("status" in item) || item.status !== "inProgress") this.itemCompleted(item);
+      seen.set(item.id, fingerprint);
+    }
+    return native.items.slice(first + 1).some((item) => item.type === "agentMessage");
+  }
+
+  private async watchPeerTurn(run: NonNullable<ClaudeSession["peerRun"]>, ownerPid: number, mode: string, replayOnly = false): Promise<void> {
+    try {
+      if (!replayOnly) await submitPeer(run.bridge, run.binding, ownerPid, mode, this.settings.cwd);
+      const waiting: ThreadItem = { type: "reasoning", id: `${run.binding.turnId}:native-peer-status`, summary: ["Waiting for the original Claude App to receive this message…"], content: [] };
+      this.itemStarted(waiting);
+      this.itemCompleted(waiting);
+      const deadline = Date.now() + 920_000;
+      while (run.watching && this.peerRun === run && Date.now() < deadline) {
+        const job = await readPeerJob(run.bridge, run.binding);
+        if (job.delivery_message_uuid) {
+          if (run.binding.nativeUuid && run.binding.nativeUuid !== job.delivery_message_uuid) throw new Error("Native App delivery identity changed; inspect the original chat before retrying.");
+          run.binding.nativeUuid = job.delivery_message_uuid;
+          if (!run.binding.verified) {
+            run.binding.verified = true;
+            peerBindings(this.host.config).save(run.binding);
+          }
+          this.itemCompleted({ ...waiting, summary: ["The original Claude App is processing this message."] });
+        }
+        const hasReply = await this.publishPeerHistory(run.binding, run.items);
+        if (["failed", "failed_before_send", "unknown"].includes(job.status)) throw new Error(job.error ?? "Native App delivery is not confirmed; no automatic resend.");
+        if (job.status === "completed") {
+          if (!job.delivery_message_uuid || !hasReply) throw new Error("Native App replied but canonical history is not yet correlated; no automatic resend.");
+          this.peerRun = undefined;
+          this.state = "idle";
+          this.completeTurn();
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      if (run.watching) throw new Error("Native App delivery is still unknown; inspect the original chat. No automatic resend.");
+    } catch (error) {
+      if (this.peerRun === run && this.turn) {
+        this.turn.error = error instanceof Error ? error.message : String(error);
+        this.peerRun = undefined;
+        this.state = "idle";
+        this.completeTurn();
+      }
+    }
+  }
+
   /** Text-only turn issued by CCodex itself (e.g. `/goal`, `/compact <prompt>`). */
   public async command(text: string): Promise<Turn> {
     return this.startTurn({ input: [{ type: "text", text, text_elements: [] }] });
   }
 
   public async steer(params: JsonObject): Promise<string> {
+    if (this.peerRun) throw invalidRequest("Shared App input is queued between turns; the current App turn was not interrupted.");
     if (!this.turn) throw invalidRequest("no active turn to steer");
     // Waiting for sub-agents the chat is done, as stock's is: Desktop then drops the copy it showed and sends a new turn.
     if (this.turn.waiting) throw invalidRequest("no active turn to steer");
@@ -525,6 +643,7 @@ export class ClaudeSession {
   }
 
   public async interrupt(): Promise<void> {
+    if (this.peerRun) throw invalidRequest("This message is running in the original Claude App. No App task was stopped; use the original App to interrupt it.");
     if (!this.turn) return;
     this.turn.interrupted = true;
     if (!this.sdk) {
@@ -591,6 +710,16 @@ export class ClaudeSession {
   }
 
   public async updateSettings(params: JsonObject): Promise<void> {
+    if (nativePeerConfig(this.host.config) && foreignOwner(this.host.config.claudeHome, this.threadId)) {
+      const actual = this.host.nativeSettings(this.threadId);
+      this.settings = actual;
+      const requested = this.host.settingsFrom(params, actual);
+      if (JSON.stringify(requested) !== JSON.stringify(actual)) {
+        this.emit("thread/settings/updated", { threadId: this.threadId, threadSettings: this.host.threadSettings(actual) });
+        throw invalidRequest("The original Claude App controls this shared session's model and permissions; no setting was changed.");
+      }
+      return;
+    }
     const next = this.host.settingsFrom(params, this.settings);
     const changed = JSON.stringify(next) !== JSON.stringify(this.settings);
     if (!changed) return;

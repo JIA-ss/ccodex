@@ -121,6 +121,29 @@ Claude's 30-day cleanup deleted come back as text. The 0.4 databases move to
   gateway runs Desktop's own Codex CLI when the Desktop on this machine starts it (the one Desktop runs without
   CCodex), otherwise the newest `codex` on the machine; a plain `codex …` in a terminal runs the first one on PATH.
 
+## Local opt-in: share an existing Claude App writer
+
+This local fork can route an occupied Claude session's ordinary text to its existing native process. It does not remove the single-writer guard or start a second query against that transcript. New messages in unoccupied Claude sessions continue through the normal SDK path; GPT is unchanged. Retries of an already submitted shared message are reconciled against its receipt even if its original owner has since exited.
+
+The feature is off unless `~/.ccodex/native-peer-bridge.json` contains an explicit configuration:
+
+```json
+{
+  "enabled": true,
+  "python": "/path/to/bridge/python",
+  "script": "/path/to/claude-sessions/scripts/bridge.py",
+  "stateDir": "/path/to/private/claude-sessions-bridge-state"
+}
+```
+
+The configured helper is a separate user-owned prerequisite. It must support native-only submission with an expected owner PID, durable request IDs, private local socket authentication, and canonical transcript readback. The qualified native protocol is Claude Code 2.1.325. A missing, changed or unqualified owner fails before sending; it must not silently fall back to CLI resume. Use the same private helper state directory as other local senders so ambiguous or active submissions are serialized together.
+
+Shared input preserves real local sender attribution and the original App's receive/permission policy. It is **not invisible**: source markers and prompt content enter the original conversation and may be sent upstream by the App. No OAuth credentials are copied, no cloud inference API is reimplemented, and no model rewrites the reply in the middle.
+
+The existing process receives input with native priority `next`; the current App task is not interrupted. A stable client message ID deduplicates retries; unknown outcomes are never automatically resent. Native history IDs and client bubble IDs are mapped across read, resume and paging. Replies and tool progress follow the original transcript as the App writes it, rather than a separate token stream.
+
+The first version accepts text only. Model, effort, speed, plan/permission modes, workspace, history edits, stop and steer controls remain with the original App; this path does not secretly alter its settings or stop its background work. App refusal/hold policies remain effective. Disabling the sidecar prevents new shared submissions; let active shared work reach a known terminal state before removing live methods. Keep private receipts and ID bindings for retries and history.
+
 ## Troubleshooting
 
 - `ccodex doctor` checks Node, Codex and Claude and their logins, the prebuilt native
