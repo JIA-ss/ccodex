@@ -415,6 +415,33 @@ function responseBlocks(records: readonly AssistantRecord[]): ResponseBlock[] {
     ({ record, block, index: (record.apiBlockIndex ?? 0) + position, id: blockItemId(record, position) })));
 }
 
+/** Claude App's end-of-turn "next step" box: a question with reply buttons the App shows under the last message. */
+export const WRAP_UP_TOOL = "mcp__ccd_turn__wrap_up";
+const WRAP_UP_ACTION_LABELS: Record<string, string> = {
+  commit: "Commit", create_pr: "Create PR", merge: "Merge", fix_ci: "Fix CI", address_comments: "Address comments",
+  resolve_conflicts: "Resolve conflicts", verify: "Verify", archive: "Archive", new_session: "New session",
+};
+
+/**
+ * The App's buttons as stock's async question (an agent message carrying `questions`): Codex shows the options, and
+ * a pick comes back as an ordinary user message, as a button click does in the App. The wrap-up has already ended
+ * the App's turn, so nothing waits on the answer.
+ */
+export function wrapUpQuestion(toolUseId: string, input: Record<string, unknown> | undefined): ThreadItem[] {
+  const ask = string(input?.ask)?.trim();
+  const actions = Array.isArray(input?.actions) ? input.actions : [];
+  const options = [...new Set(actions.flatMap((action) => {
+    const entry = object(action);
+    const label = string(entry?.label)?.trim() || WRAP_UP_ACTION_LABELS[string(entry?.action) ?? ""];
+    return label ? [label] : [];
+  }))];
+  if (!ask || !options.length) return [];
+  return [{
+    type: "agentMessage", id: `${toolUseId}-ask`, text: ask, phase: "final_answer", memoryCitation: null,
+    delivery: "async", questions: [{ title: ask, options }],
+  }];
+}
+
 function assistantItems(
   records: readonly AssistantRecord[],
   cwd: string,
@@ -450,6 +477,7 @@ function assistantItems(
       // Stopping a background command shows on the command (stock's Ctrl-C), not as a call of its own.
       if (stoppedCommand(completion?.record.toolUseResult)) return [];
       const item = projectTool(block as unknown as ToolUseBlock, index, record, cwd, threadId, completions, peers, ends);
+      if (block.name === WRAP_UP_TOOL) return [item, ...wrapUpQuestion(block.id, object(block.input))];
       if (!CODEX_MCP_TOOLS.has(block.name)) return [item];
       const result = completion?.block.content;
       return [item, ...codexMcpItems(block.id, object(block.input) ?? {}, result === undefined ? undefined : outputText(result), codexCalls)];
