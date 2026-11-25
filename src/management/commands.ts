@@ -262,7 +262,16 @@ export async function setup(args: readonly string[]): Promise<number> {
   return 0;
 }
 
+/** A build made from a checkout (`scripts/local-install.sh`), not a published package. */
+export const isLocalBuild = (version: string): boolean => /-local\./u.test(version);
+
 export async function update(args: readonly string[]): Promise<number> {
+  // The published package knows nothing of a local build's changes: installing it over one would silently drop them.
+  if (isLocalBuild(packageVersion()) && !args.includes("--upstream")) {
+    process.stdout.write(`CCodex ${packageVersion()} is a local build; 'ccodex update' would replace it with the published package and drop its changes.\n`
+      + "Rebuild it from its checkout with scripts/local-install.sh, or pass --upstream to install the published package anyway.\n");
+    return 0;
+  }
   const channel = args.includes("--next") ? "next" : "latest";
   const check = args.includes("--check");
   const { stdout } = await execute("npm", ["view", PACKAGE, `dist-tags.${channel}`, "--json"], { timeout: 30_000 });
