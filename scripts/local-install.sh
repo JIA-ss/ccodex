@@ -51,7 +51,9 @@ ln -s "$ROOT/node_modules" "$STAGE/node_modules"
 (cd "$STAGE" && ./node_modules/.bin/tsc -p config/tsconfig.build.json)
 
 if [ -z "$RELAY" ]; then
-  PATH="$HOME/.cargo/bin:$PATH" cargo build --manifest-path "$ROOT/relay/Cargo.toml" --release
+  # Not stripped: the release profile's `strip = true` runs Xcode's strip over the build's own proc-macro libraries
+  # too, and on macOS 27 the stripped ones no longer load ("mis-aligned LINKEDIT string pool").
+  PATH="$HOME/.cargo/bin:$PATH" CARGO_PROFILE_RELEASE_STRIP=false cargo build --manifest-path "$ROOT/relay/Cargo.toml" --release
   RELAY="${CARGO_TARGET_DIR:-$ROOT/relay/target}/release/codex-hybrid-remote-relay"
 fi
 [ -x "$RELAY" ] || { echo "No relay binary at $RELAY" >&2; exit 1; }
