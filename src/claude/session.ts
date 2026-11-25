@@ -24,7 +24,7 @@ import { baseOptions, claudeMode } from "./sdk.js";
 import { endedBackground, killedCommand, proposedChanges, startTool, stoppedCommand, updateToolInput, type ActiveTool, type BackgroundEnd } from "./toolMapper.js";
 import type { ClaudeThreads } from "./threads.js";
 import { visualizeOptions } from "./visualize.js";
-import { nativePeerConfig, peerBindings, preparePeerBinding, readPeerJob, submitPeer, type PeerBinding, type NativePeerConfig } from "./nativePeer.js";
+import { nativePeerConfig, peerBindings, peerInputMatches, preparePeerBinding, readPeerJob, submitPeer, type PeerBinding, type NativePeerConfig } from "./nativePeer.js";
 
 export interface SessionSettings {
   cwd: string;
@@ -436,7 +436,7 @@ export class ClaudeSession {
     const owner = foreignOwner(this.host.config.claudeHome, this.threadId);
     if (this.peerRun) {
       if ((params.clientUserMessageId ?? params.turnId) === this.peerRun.binding.clientId && this.turn) {
-        if (JSON.stringify(normalizeUserInput(params.input ?? [])) !== JSON.stringify(this.peerRun.binding.input)) throw invalidRequest("Shared message identity conflict; no second message was sent.");
+        if (!peerInputMatches(this.peerRun.binding, normalizeUserInput(params.input ?? []))) throw invalidRequest("Shared message identity conflict; no second message was sent.");
         return startedTurn(this.liveTurn()!);
       }
       await this.steerPeerTurn(params);
@@ -522,7 +522,7 @@ export class ClaudeSession {
       originMode: next.permissionMode === "bypassPermissions" ? "bypassPermissions" : "default" };
     this.peerRun = run;
     this.state = "running";
-    return startedTurn(this.openTurn(kept.turnId, input, kept.clientId, false, false, () => {
+    return startedTurn(this.openTurn(kept.turnId, kept.input, kept.clientId, false, false, () => {
       void this.watchPeerTurn(run, ownerPid, run.originMode, replayOnly);
     }));
   }
@@ -658,7 +658,7 @@ export class ClaudeSession {
     const owner = foreignOwner(this.host.config.claudeHome, this.threadId), bridge = nativePeerConfig(this.host.config);
     const prior = [...peerBindings(this.host.config).jobs.values()].find((b) => b.threadId === this.threadId && b.clientId === params.clientUserMessageId);
     if (prior?.steerOf && bridge) {
-      if (JSON.stringify(prior.input) !== JSON.stringify(normalizeUserInput(params.input ?? []))) throw invalidRequest("Shared correction identity conflict; no message sent.");
+      if (!peerInputMatches(prior, normalizeUserInput(params.input ?? []))) throw invalidRequest("Shared correction identity conflict; no message sent.");
       const job = await readPeerJob(bridge, prior);
       if (job.status !== "completed") throw invalidRequest(job.error ?? "Previous correction is not confirmed; no automatic resend.");
       return prior.parentTurnId!;

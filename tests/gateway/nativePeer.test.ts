@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fakeClaude, fakeQuery, fakeStartup } from "../fixtures/fakeClaude.js";
@@ -12,7 +12,7 @@ const originalEnv = { ...process.env };
 const roots: string[] = [];
 let gateway: TestGateway | undefined;
 afterEach(async () => { await gateway?.stop(); gateway = undefined; process.env = { ...originalEnv }; for (const p of roots.splice(0)) rmSync(p, { recursive: true, force: true }); });
-const text = (value: string) => [{ type: "text", text: value, text_elements: [] }];
+const text = (value: string) => [{ type: "text" as const, text: value, text_elements: [] }];
 
 async function fixture() {
   fakeClaude.reset();
@@ -65,7 +65,7 @@ describe("shared native App writer", () => {
     await expect(client.request("thread/settings/update", { threadId: sid, model: "claude:claude-haiku-4-5-20251001" })).rejects.toThrow("no setting was changed");
     await expect(client.request("thread/revert", { threadId: sid, beforeTurnId: "initial-user" })).rejects.toThrow("no App task or history was changed");
     await expect(client.request("thread/compact/start", { threadId: sid })).rejects.toThrow("no App task or history was changed");
-    await expect(client.request("turn/start", { threadId: sid, clientUserMessageId: randomUUID(), input: [{ type: "image", url: "data:image/png;base64,fixture" }] })).rejects.toThrow("text only");
+    await expect(client.request("turn/start", { threadId: sid, clientUserMessageId: randomUUID(), input: [{ type: "audio", url: "data:audio/wav;base64,fixture" }] })).rejects.toThrow("supports text and images");
     expect(existsSync(join(root, "sends.jsonl"))).toBe(false);
     const clientId = randomUUID();
     await client.request("turn/start", { threadId: sid, clientUserMessageId: clientId, input: text("one") });
@@ -74,6 +74,68 @@ describe("shared native App writer", () => {
     await expect(client.request("turn/steer", { threadId: sid, input: text("two") })).rejects.toThrow("stable client message");
     const done = await client.waitFor("turn/completed", (p) => p.threadId === sid, 10000);expect(done.turn.status).toBe("completed");
     expect(fakeClaude.calls.some((c) => c.method === "interrupt")).toBe(false);
+  }, 20000);
+
+  it("passes same-chat mobile images to the native owner and replays the receipt after an upload expires", async () => {
+    const { root, sid, client, state } = await fixture();
+    const attachmentDir = join("/tmp/codex-remote-attachments", sid);
+    const uploadDir = join(attachmentDir, randomUUID());
+    roots.push(attachmentDir);
+    mkdirSync(uploadDir, { recursive: true });
+    const image = join(uploadDir, "照片 1.jpg");
+    const input = [{ type: "localImage" as const, path: image }];
+    await expect(client.request("turn/start", { threadId: sid, clientUserMessageId: randomUUID(), input: [{ type: "localImage", path: join(root, "outside.jpg") }] })).rejects.toThrow("uploaded to this chat");
+    const outside = join(root, "outside.jpg");
+    writeFileSync(outside, "fixture");
+    symlinkSync(outside, image);
+    const rejected = await client.request("turn/start", { threadId: sid, clientUserMessageId: randomUUID(), input });
+    const failed = await client.waitFor("turn/completed", (p) => p.threadId === sid && p.turn.id === rejected.turn.id, 10000);
+    expect(failed.turn.error.message).toContain("no message was sent");
+    expect(existsSync(join(root, "sends.jsonl"))).toBe(false);
+    rmSync(image);
+    writeFileSync(image, "fixture");
+    const params = { threadId: sid, clientUserMessageId: randomUUID(), input };
+    const result = await client.request("turn/start", params);
+    const done = await client.waitFor("turn/completed", (p) => p.threadId === sid && p.turn.id === result.turn.id, 10000);
+    expect(done.turn.status).toBe("completed");
+    const binding = preparePeerBinding(sid, params.clientUserMessageId, input);
+    const job = JSON.parse(readFileSync(join(state, `${binding.jobId}.json`), "utf8"));
+    expect(job.prompt).toContain(`\n${JSON.stringify(image)}`);
+    const turn = (await client.request("thread/read", { threadId: sid, includeTurns: true })).thread.turns.find((item: any) => item.id === result.turn.id);
+    expect(turn.items.find((item: any) => item.type === "userMessage").content).toEqual(input);
+    rmSync(image);
+    const replay = await client.request("turn/start", params);
+    expect(replay.turn.id).toBe(result.turn.id);
+    expect(readFileSync(join(root, "sends.jsonl"), "utf8").trim().split("\n")).toHaveLength(1);
+    expect(fakeClaude.prompts).toHaveLength(0);
+  }, 20000);
+
+  it("stages inline images without persisting base64 or duplicating a native send", async () => {
+    const { root, sid, client, state } = await fixture();
+    roots.push(join("/tmp/codex-remote-attachments", sid));
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==";
+    const clientId = randomUUID();
+    const input = [...text("read the inline image"), { type: "image" as const, url: `data:image/png;base64,${png}` }];
+    const params = { threadId: sid, clientUserMessageId: clientId, input };
+    await expect(client.request("turn/start", { ...params, input: [{ type: "image", url: `data:image/gif;base64,${png}` }] })).rejects.toThrow("image");
+    await expect(client.request("turn/start", { ...params, input: [{ type: "image", url: "https://example.invalid/image.png" }] })).rejects.toThrow("image");
+    expect(existsSync(join(root, "sends.jsonl"))).toBe(false);
+    const { turn } = await client.request("turn/start", params);
+    expect((await client.request("turn/start", params)).turn.id).toBe(turn.id);
+    const done = await client.waitFor("turn/completed", (p) => p.threadId === sid && p.turn.id === turn.id, 10000);
+    expect(done.turn.status).toBe("completed");
+    const history = (await client.request("thread/read", { threadId: sid, includeTurns: true })).thread.turns.find((t: any) => t.id === turn.id);
+    const bubble = history.items.find((i: any) => i.type === "userMessage");
+    const image = bubble.content.find((item: any) => item.type === "localImage");
+    expect(image.path).toMatch(new RegExp(`^/tmp/codex-remote-attachments/${sid}/`));
+    expect(readFileSync(image.path)).toEqual(Buffer.from(png, "base64"));
+    expect(statSync(image.path).mode & 0o777).toBe(0o600);
+    const binding = preparePeerBinding(sid, clientId, input);
+    const job = readFileSync(join(state, `${binding.jobId}.json`), "utf8");
+    expect(job).toContain(image.path);
+    expect(job).not.toContain(png);
+    expect(readFileSync(join(root, "data", "native-peer-turns.json"), "utf8")).not.toContain(png);
+    expect(readFileSync(join(root, "sends.jsonl"), "utf8").trim().split("\n")).toHaveLength(1);
   }, 20000);
 
   it("soft-steers the active App turn, deduplicates corrections, and retains their client bubbles", async () => {

@@ -1,9 +1,9 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { linkSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { lstat, readFile, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, extname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { v5 as uuidv5 } from "uuid";
 import type { Config } from "../config.js";
@@ -13,6 +13,17 @@ export interface NativePeerConfig { enabled: true; python: string; script: strin
 export interface PeerBinding { jobId: string; threadId: string; turnId: string; clientId: string; input: UserInput[]; nativeUuid?: string; verified?: boolean; steerOf?: string; parentTurnId?: string }
 export interface PeerJob { job_id: string; status: string; error?: string; delivery_message_uuid?: string; partial_result?: string; result?: string; transport?: string; expected_native_pid?: number }
 const execute = promisify(execFile);
+const mobileAttachmentRoot = "/tmp/codex-remote-attachments";
+const uploadId = /^[\da-f]{8}-(?:[\da-f]{4}-){3}[\da-f]{12}$/iu;
+const imageExtensions = new Set([".gif", ".jpeg", ".jpg", ".png", ".webp"]);
+const inlineImageHeader = /^data:image\/(png|jpeg|gif|webp);base64,/iu;
+const maxInlineImageBytes = 20 * 1024 * 1024;
+const inlineImageSignatures: Record<string, Buffer[]> = {
+  png: [Buffer.from("89504e470d0a1a0a", "hex")],
+  jpeg: [Buffer.from("ffd8ff", "hex")],
+  gif: [Buffer.from("GIF87a"), Buffer.from("GIF89a")],
+  webp: [Buffer.from("RIFF")],
+};
 
 /** Explicit opt-in sidecar also permits enabling this path without restarting a live gateway. */
 export function nativePeerConfig(config: Config): NativePeerConfig | undefined {
@@ -53,16 +64,116 @@ export function peerBindings(config: Config): PeerBindings {
 
 export function preparePeerBinding(threadId: string, clientId: unknown, input: UserInput[]): PeerBinding {
   if (typeof clientId !== "string" || !clientId || clientId.length > 120) throw new Error("Shared App input requires a stable client message identifier; no message was sent.");
-  if (!input.length || input.some((item) => item.type !== "text")) throw new Error("The original App connection currently accepts text only; no attachment was sent.");
-  const text = input.map((item) => item.type === "text" ? item.text : "").join("\n");
-  if (!text.trim() || text.length > 100_000) throw new Error("Shared App input must be nonempty text under 100,000 characters; nothing was sent.");
   const requestId = `ccodex-native-peer:${threadId}:${clientId}`;
-  return { jobId: createHash("sha256").update(requestId).digest("hex").slice(0, 32), threadId,
-    turnId: uuidv5(requestId, uuidv5.URL), clientId, input };
+  const jobId = createHash("sha256").update(requestId).digest("hex").slice(0, 32);
+  const prepared = preparePeerInput(threadId, jobId, input);
+  const binding = { jobId, threadId, turnId: uuidv5(requestId, uuidv5.URL), clientId, input: prepared.input };
+  const prompt = peerPrompt(binding);
+  if (!prompt.trim() || prompt.length > 100_000) throw new Error("Shared App input must be nonempty and under 100,000 characters; nothing was sent.");
+  for (const [path, bytes] of prepared.images) stageInlineImage(threadId, path, bytes);
+  return binding;
+}
+
+export function peerInputMatches(binding: PeerBinding, input: UserInput[]): boolean {
+  return JSON.stringify(binding.input) === JSON.stringify(preparePeerInput(binding.threadId, binding.jobId, input).input);
+}
+
+function preparePeerInput(threadId: string, jobId: string, input: UserInput[]) {
+  const images = new Map<string, Buffer>();
+  let remaining = maxInlineImageBytes;
+  const parts = input.map((item, index): UserInput => {
+    if (item.type === "text") return item;
+    if (item.type === "localImage") {
+      mobileImagePath(threadId, item.path);
+      return item;
+    }
+    if (item.type !== "image") throw new Error("Shared App input supports text and images; no message was sent.");
+    const header = typeof item.url === "string" && inlineImageHeader.exec(item.url);
+    if (!header || !uploadId.test(threadId)) throw new Error("Shared App inline images must be PNG, JPEG, GIF or WebP image data; no message was sent.");
+    const encoded = item.url.slice(header[0].length);
+    if (encoded.length > Math.ceil(remaining / 3) * 4) throw new Error("Shared App inline images exceed 20 MiB in this message; no message was sent.");
+    const bytes = Buffer.from(encoded, "base64");
+    const format = header[1]!.toLowerCase();
+    const validSignature = inlineImageSignatures[format]!.some((signature) => bytes.subarray(0, signature.length).equals(signature));
+    if (!validSignature || bytes.toString("base64") !== encoded || (format === "webp" && bytes.toString("ascii", 8, 12) !== "WEBP")) {
+      throw new Error("Shared App inline image data is invalid; no message was sent.");
+    }
+    remaining -= bytes.length;
+    if (remaining < 0) throw new Error("Shared App inline images exceed 20 MiB in this message; no message was sent.");
+    const hash = createHash("sha256").update(bytes).digest("hex");
+    const upload = uuidv5(`${jobId}:${index}:${hash}`, uuidv5.URL);
+    const path = join(mobileAttachmentRoot, threadId, upload, `image.${format}`);
+    images.set(path, bytes);
+    return { type: "localImage", path, detail: item.detail };
+  });
+  return { input: parts, images };
+}
+
+function stageInlineImage(threadId: string, path: string, bytes: Buffer): void {
+  try {
+    const tmp = realpathSync("/tmp");
+    for (const dir of [mobileAttachmentRoot, join(mobileAttachmentRoot, threadId), dirname(path)]) {
+      try { mkdirSync(dir, { mode: 0o700 }); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+      const stat = lstatSync(dir);
+      if (!stat.isDirectory() || stat.uid !== process.getuid?.() || (stat.mode & 0o022) || realpathSync(dir) !== tmp + dir.slice(4)) {
+        throw new Error("Unsafe image directory");
+      }
+    }
+    const staging = join(dirname(path), `.${randomUUID()}.tmp`);
+    try {
+      writeFileSync(staging, bytes, { flag: "wx", mode: 0o600 });
+      try { linkSync(staging, path); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        const file = lstatSync(path);
+        if (!file.isFile() || file.uid !== process.getuid?.() || (file.mode & 0o077) || file.size !== bytes.length || !readFileSync(path).equals(bytes)) throw error;
+      }
+    } finally { rmSync(staging, { force: true }); }
+  } catch {
+    throw new Error("Shared App could not save the inline image in its private upload directory; no message was sent.");
+  }
+}
+
+function mobileImagePath(threadId: string, path: string): string {
+  if (typeof path !== "string") throw new Error("Shared App image path is missing; no message was sent.");
+  const from = path.startsWith("/private/tmp/") ? path.slice("/private".length) : path;
+  const prefix = `${mobileAttachmentRoot}/${threadId}/`;
+  const segments = from.startsWith(prefix) ? from.slice(prefix.length).split("/") : [];
+  if (uploadId.test(threadId) && segments.length === 2 && uploadId.test(segments[0]!)
+      && !/[\u0000-\u001f\u007f\u2028\u2029]/u.test(from) && resolve(from) === from
+      && imageExtensions.has(extname(segments[1]!).toLowerCase())) return from;
+  throw new Error("Shared App images must be supported files uploaded to this chat; no message was sent.");
+}
+
+function peerPrompt(binding: PeerBinding): string {
+  const text = binding.input.map((item) => item.type === "text" ? item.text : "").join("\n");
+  const paths = binding.input.flatMap((item) => item.type === "localImage" ? [mobileImagePath(binding.threadId, item.path)] : []);
+  if (!paths.length) return text;
+  return `${text.trim() ? text + "\n\n" : ""}The user attached the following local image files. Use Read on these exact paths to view the images before answering. If a file cannot be read, say so.\n${paths.map((path) => JSON.stringify(path)).join("\n")}`;
 }
 
 export async function submitPeer(bridge: NativePeerConfig, binding: PeerBinding, ownerPid: number, mode: string, cwd: string): Promise<PeerJob> {
-  const prompt = binding.input.map((item) => item.type === "text" ? item.text : "").join("\n");
+  const prompt = peerPrompt(binding);
+  const images = binding.input.filter((item) => item.type === "localImage");
+  if (images.length) {
+    // A retired upload does not invalidate an existing native receipt or cause another send.
+    try { return await readPeerJob(bridge, binding); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    try {
+      if (!(await lstat(mobileAttachmentRoot)).isDirectory()) throw new Error("Invalid image upload directory");
+      const root = await realpath(mobileAttachmentRoot);
+      for (const image of images) {
+        const path = mobileImagePath(binding.threadId, image.path);
+        const file = await lstat(path);
+        if (!file.isFile() || !file.size || await realpath(path) !== root + path.slice(mobileAttachmentRoot.length)) {
+          throw new Error("Invalid image upload");
+        }
+      }
+    } catch {
+      throw new Error("An uploaded image is missing or unreadable; no message was sent. Attach the image again.");
+    }
+  }
   const args = { session_id: binding.threadId, prompt, request_id: `ccodex-native-peer:${binding.threadId}:${binding.clientId}`,
     permission_mode: mode, directory: cwd, timeout_seconds: 900, require_native: true, expected_native_pid: ownerPid,
     ...(binding.steerOf ? { steer_of: binding.steerOf } : {}) };
@@ -89,7 +200,7 @@ export async function readPeerJob(bridge: NativePeerConfig, binding: PeerBinding
   const root = bridge.stateDir ?? join(homedir(), ".local", "state", "claude-sessions-bridge");
   const job = JSON.parse(await readFile(join(root, `${binding.jobId}.json`), "utf8"));
   if (job.job_id !== binding.jobId || (job.transport && job.transport !== "native_peer")) throw new Error("Unexpected shared App transport");
-  if (job.session_id !== binding.threadId || job.prompt !== binding.input.map((item) => item.type === "text" ? item.text : "").join("\n")) throw new Error("Shared App job payload conflict; no message was retried.");
+  if (job.session_id !== binding.threadId || job.prompt !== peerPrompt(binding)) throw new Error("Shared App job payload conflict; no message was retried.");
   return job;
 }
 
