@@ -4,8 +4,10 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  rename,
   rm,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -74,6 +76,28 @@ describe("native Claude session catalog", () => {
     expect(catalog.get(fixtureIds[0])?.hasSubagents).toBe(false);
     expect(catalog.get(fixtureIds[1])?.hasSubagents).toBe(false);
     expect(catalog.get(fixtureIds[2])?.hasSubagents).toBe(true);
+  });
+
+  it("lists sessions of a project folder, and a transcript, that are symbolic links", async () => {
+    const { root, projects, project, sessionId } = await temporaryCatalog();
+    // The project moved to another volume and linked back; a second project holds a linked transcript and a dangling link.
+    const moved = join(root, "elsewhere", "-moved-project");
+    await mkdir(join(root, "elsewhere"), { recursive: true });
+    await rename(project, moved);
+    await symlink(moved, project);
+    const other = join(projects, "-other-project");
+    await mkdir(other);
+    await copyFile(join(fixtureProject, `${fixtureIds[1]}.jsonl`), join(root, "elsewhere", "kept.jsonl"));
+    await symlink(join(root, "elsewhere", "kept.jsonl"), join(other, `${fixtureIds[1]}.jsonl`));
+    await symlink(join(root, "elsewhere", "gone.jsonl"), join(other, `${fixtureIds[2]}.jsonl`));
+    await symlink(join(root, "elsewhere", "gone"), join(projects, "-dangling-project"));
+    try {
+      const catalog = new NativeSessionCatalog(projects);
+      await catalog.refresh();
+      expect(catalog.sessions().map((session) => session.sessionId).sort()).toEqual([sessionId, fixtureIds[1]].sort());
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("shares thread header rules with projections", async () => {

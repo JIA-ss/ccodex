@@ -1,6 +1,6 @@
 /** Owns discovery, incremental summaries, projection caching, and filesystem watches for native sessions. */
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, watch as watchFileSystem, type FSWatcher } from "node:fs";
+import { mkdirSync, readFileSync, watch as watchFileSystem, type Dirent, type FSWatcher } from "node:fs";
 import { open, readdir, rename, stat, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import type { PeerDirectory } from "../peers.js";
@@ -112,6 +112,24 @@ async function hashHead(path: string, length: number): Promise<string> {
   } finally {
     await handle.close();
   }
+}
+
+/**
+ * The entries of `parent` that are directories (or files), a symbolic link counted by what it points at: a project
+ * folder or a transcript moved to another volume and linked back is still that project's.
+ */
+async function keepEntries(parent: string, entries: Dirent[], kind: "directory" | "file"): Promise<Dirent[]> {
+  const kept = await Promise.all(entries.map(async (entry) => {
+    if (kind === "directory" ? entry.isDirectory() : entry.isFile()) return entry;
+    if (!entry.isSymbolicLink()) return undefined;
+    try {
+      const target = await stat(join(parent, entry.name));
+      return (kind === "directory" ? target.isDirectory() : target.isFile()) ? entry : undefined;
+    } catch {
+      return undefined;
+    }
+  }));
+  return kept.filter((entry): entry is Dirent => entry !== undefined);
 }
 
 export class NativeSessionCatalog implements PeerDirectory {
@@ -322,8 +340,7 @@ export class NativeSessionCatalog implements PeerDirectory {
   private async discover(): Promise<DiscoveredFile[]> {
     let projects;
     try {
-      projects = (await readdir(this.projectsDir, { withFileTypes: true }))
-        .filter((entry) => entry.isDirectory())
+      projects = (await keepEntries(this.projectsDir, await readdir(this.projectsDir, { withFileTypes: true }), "directory"))
         .sort((left, right) => left.name.localeCompare(right.name));
     } catch (error) {
       if (ignored(error)) {
@@ -337,8 +354,7 @@ export class NativeSessionCatalog implements PeerDirectory {
       const projectDirectory = join(this.projectsDir, project.name);
       let names;
       try {
-        names = (await readdir(projectDirectory, { withFileTypes: true }))
-          .filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
+        names = (await keepEntries(projectDirectory, (await readdir(projectDirectory, { withFileTypes: true })).filter((entry) => entry.name.endsWith(".jsonl")), "file"))
           .sort((left, right) => left.name.localeCompare(right.name));
       } catch (error) {
         if (ignored(error)) return [];
