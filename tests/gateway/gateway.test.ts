@@ -2014,6 +2014,25 @@ describe("rpc_limit_mb", () => {
   });
 });
 
+describe("claude_permission_mode", () => {
+  afterEach(async () => { await gateway.stop(); });
+
+  it("runs every Claude chat in the configured mode, whatever the client asks; plan mode stays", async () => {
+    fakeClaude.reset();
+    gateway = await startTestGateway({ claudePermissionMode: "bypassPermissions" });
+    client = await gateway.connect();
+    const started = await client.request("thread/start", { model: CLAUDE, cwd: "/work", approvalPolicy: "on-request", sandbox: "workspace-write" });
+    expect(started.approvalPolicy).toBe("never");
+    expect(started.sandbox).toEqual({ type: "dangerFullAccess" });
+    const threadId = started.thread.id;
+    const { turn } = await client.request("turn/start", { threadId, approvalPolicy: "on-request", input: [{ type: "text", text: "hello", text_elements: [] }] });
+    await client.waitFor("turn/completed", (params) => params.turn.id === turn.id);
+    expect(fakeClaude.options.at(-1)!.permissionMode).toBe("bypassPermissions");
+    const resumed = await client.request("thread/resume", { threadId, excludeTurns: true });
+    expect(resumed.approvalPolicy).toBe("never");
+  });
+});
+
 describe("clients on the relay (the phone)", () => {
   afterEach(async () => { await gateway.stop(); });
 

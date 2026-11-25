@@ -23,6 +23,14 @@ export interface Config {
   readonly rpcCaptureMaxBytes: number;
   /** The most a client gets in one message, or as one command's output (`rpc_limit_mb`); 0: no limit. */
   readonly rpcLimitBytes: number;
+  /**
+   * An idle Claude App process that holds a chat (the App keeps one after it opens or imports a chat) is asked to exit
+   * when CCodex is to work on that chat, which then runs here as any other, not through the shared-session bridge
+   * (`claude_app_idle_takeover`). A busy App process is never touched.
+   */
+  readonly claudeAppIdleTakeover: boolean;
+  /** Every Claude chat runs in this permission mode, whatever the client asks or the transcript last recorded; plan mode stays (`claude_permission_mode`). */
+  readonly claudePermissionMode: string | null;
   /** For clients on the relay (the phone): text deltas of one item join into one message per this many ms (`remote_delta_join_ms`); 0: each as it comes. */
   readonly remoteDeltaJoinMs: number;
   /** The most one history page holds for a client on the relay (`remote_history_page_kb`): the newest entries come first, the rest by cursor; 0: `rpc_limit_mb` alone. */
@@ -200,6 +208,8 @@ export function loadConfig(): Config {
     rpcCapture: process.env.CCODEX_RPC_CAPTURE ? process.env.CCODEX_RPC_CAPTURE === "1" : file.rpc_capture ?? false,
     rpcCaptureMaxBytes: file.rpc_capture_max_bytes ?? 1_073_741_824,
     rpcLimitBytes: (file.rpc_limit_mb ?? 10) * 1_000_000,
+    claudeAppIdleTakeover: file.claude_app_idle_takeover ?? false,
+    claudePermissionMode: file.claude_permission_mode ?? null,
     remoteDeltaJoinMs: file.remote_delta_join_ms ?? 800,
     remotePageBytes: (file.remote_history_page_kb ?? 256) * 1_000,
     remoteImageMaxPx: file.remote_image_max_px ?? 1024,
